@@ -31,6 +31,10 @@ static RESTORE_LOCAL_REPLICA_BEFORE_FLAG_HOOK: std::sync::Mutex<
     Option<RestoreLocalReplicaBeforeFlagHook>,
 > = std::sync::Mutex::new(None);
 
+#[cfg(test)]
+static CLEAR_LOCAL_REPLICA_HOOK: std::sync::Mutex<Vec<RestoreLocalReplicaBeforeFlagHook>> =
+    std::sync::Mutex::new(Vec::new());
+
 impl ShardReplicaSet {
     pub async fn create_snapshot(
         &self,
@@ -207,6 +211,8 @@ impl ShardReplicaSet {
             }
         };
 
+        let _data_lock =
+            cancel::future::cancel_on_token(cancel.clone(), self.local_data_lock.lock()).await?;
         let mut local = cancel::future::cancel_on_token(cancel.clone(), self.local.write()).await?;
 
         let shard_flag = shard_initializing_flag_path(collection_path, self.shard_id);
@@ -428,10 +434,18 @@ impl ShardReplicaSet {
     /// Writes the shard initializing flag before clearing, so that a crash between
     /// here and the end of the subsequent `restore_local_replica_from` call causes
     /// the shard to be loaded as a dummy on startup and re-recovered.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is not cancel safe. The collection wrapper drives it to completion
+    /// while holding the shard holder read lock, including if its caller is cancelled.
     pub async fn clear_local_for_snapshot_recovery(
         &self,
         collection_path: &Path,
     ) -> CollectionResult<()> {
+        let _data_lock = self.local_data_lock.lock().await;
+        let mut local = self.local.write().await;
+
         // Callers must only invoke this while the shard is in a state that cannot
         // be a source of truth (e.g. `PartialSnapshot` during a shard transfer).
         // Clearing a source-of-truth replica would silently drop data that may
@@ -445,8 +459,6 @@ impl ShardReplicaSet {
                 self.collection_id, self.shard_id,
             )));
         }
-
-        let mut local = self.local.write().await;
 
         // Mark the shard as initializing before touching disk, so a crash during or
         // after clearing is detected on next startup and the shard is reloaded as a
@@ -462,7 +474,13 @@ impl ShardReplicaSet {
         let dummy = Shard::Dummy(DummyShard::new(
             "Local shard is being cleared for snapshot recovery",
         ));
-        if let Some(shard) = local.replace(dummy) {
+        let old_shard = local.replace(dummy);
+        drop(local);
+
+        #[cfg(test)]
+        wait_clear_local_replica_hook_for_test(&shard_flag).await;
+
+        if let Some(shard) = old_shard {
             shard.stop_gracefully().await;
         }
 
@@ -511,3 +529,17 @@ async fn wait_restore_local_replica_before_flag_hook_for_test(shard_flag: &Path)
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+async fn wait_clear_local_replica_hook_for_test(shard_flag: &Path) {
+    let hook = {
+        let mut hook = CLEAR_LOCAL_REPLICA_HOOK.lock().unwrap();
+        hook.iter()
+            .position(|(path, _, _)| path == shard_flag)
+            .map(|index| hook.remove(index))
+    };
+    if let Some((_, reached, release)) = hook {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+}

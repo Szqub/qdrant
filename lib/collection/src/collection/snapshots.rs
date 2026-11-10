@@ -446,12 +446,18 @@ impl Collection {
     /// This is destructive, so a sender that drives a transfer consensus has since aborted must
     /// not get to wipe a replica that another transfer is populating. Senders running an older
     /// version don't identify themselves, they are only held to *some* transfer being registered.
+    ///
+    /// # Cancel safety
+    ///
+    /// Once started, cleanup runs to completion even if the caller is cancelled. The
+    /// task retains the shard holder read lock so deletion cannot outlive the replica
+    /// set and race with a new shard at the same path.
     pub async fn clear_local_shard_for_snapshot_recovery(
         &self,
         shard_id: ShardId,
         from_peer_id: Option<PeerId>,
     ) -> CollectionResult<()> {
-        let shard_holder = self.shards_holder.read().await;
+        let shard_holder = self.shards_holder.clone().read_owned().await;
 
         let transfers =
             shard_holder.get_transfers(|transfer| transfer.is_target(self.this_peer_id, shard_id));
@@ -476,11 +482,17 @@ impl Collection {
             )));
         }
 
-        shard_holder
+        let replica_set = shard_holder
             .get_shard(shard_id)
-            .ok_or_else(|| shard_not_found_error(shard_id))?
-            .clear_local_for_snapshot_recovery(&self.path)
-            .await
+            .cloned()
+            .ok_or_else(|| shard_not_found_error(shard_id))?;
+        let path = self.path.clone();
+        self.update_runtime
+            .spawn(async move {
+                let _shard_holder = shard_holder;
+                replica_set.clear_local_for_snapshot_recovery(&path).await
+            })
+            .await?
     }
 
     pub async fn try_take_partial_snapshot_recovery_lock(

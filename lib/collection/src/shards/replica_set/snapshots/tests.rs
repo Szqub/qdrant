@@ -39,6 +39,60 @@ const TEST_PEER_ID: PeerId = 1;
 const STALLED_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_updates_do_not_wait_for_snapshot_clear() {
+    let dir = Builder::new()
+        .prefix("snapshot-clear-updates")
+        .tempdir()
+        .unwrap();
+    let replica = Arc::new(new_shard_replica_set(&dir, TEST_TARGET_SHARD_ID).await);
+    replica
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+    let flag = shard_initializing_flag_path(dir.path(), TEST_TARGET_SHARD_ID);
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    CLEAR_LOCAL_REPLICA_HOOK
+        .lock()
+        .unwrap()
+        .push((flag.clone(), reached_tx, release_rx));
+    let clearing = {
+        let replica = Arc::clone(&replica);
+        let path = dir.path().to_owned();
+        tokio::spawn(async move { replica.clear_local_for_snapshot_recovery(&path).await })
+    };
+    reached_rx.await.unwrap();
+    assert!(flag.exists());
+    let update = OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
+        PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
+            PointStructPersisted {
+                id: 42.into(),
+                vector: VectorStructPersisted::Single(vec![0.1, 0.2, 0.3, 0.4]),
+                payload: None,
+            },
+        ])),
+    ));
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let rejected = replica
+            .update_local(update.clone(), WaitUntil::Visible, None, false)
+            .measured(AmbientContext::new())
+            .await
+            .unwrap();
+        assert!(rejected.is_none());
+        let forced = replica
+            .update_local(update, WaitUntil::Visible, None, true)
+            .measured(AmbientContext::new())
+            .await;
+        assert!(forced.is_err());
+    })
+    .await;
+    let _ = release_tx.send(());
+    clearing.await.unwrap().unwrap();
+    replica.stop_gracefully().await;
+    assert!(result.is_ok(), "updates waited for shard cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_snapshot_recovery_before_initializing_flag_does_not_mark_dirty() {
     let target_collection_dir = Builder::new()
         .prefix("snapshot-recovery-cancel-target")
@@ -110,6 +164,292 @@ async fn test_cancel_snapshot_recovery_before_initializing_flag_does_not_mark_di
 
     target_replica_set.stop_gracefully().await;
     source_replica_set.stop_gracefully().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_clear_serializes_restore_and_empty_initialization() {
+    let dir = Builder::new()
+        .prefix("snapshot-clear-lifecycle")
+        .tempdir()
+        .unwrap();
+    let replica = Arc::new(new_shard_replica_set(&dir, TEST_TARGET_SHARD_ID).await);
+    replica
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+    let flag = shard_initializing_flag_path(dir.path(), TEST_TARGET_SHARD_ID);
+    let (_snapshot_dir, snapshot) = new_shard_snapshot().await;
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    CLEAR_LOCAL_REPLICA_HOOK
+        .lock()
+        .unwrap()
+        .push((flag.clone(), reached_tx, release_rx));
+    let clearing = {
+        let replica = Arc::clone(&replica);
+        let path = dir.path().to_owned();
+        tokio::spawn(async move { replica.clear_local_for_snapshot_recovery(&path).await })
+    };
+    reached_rx.await.unwrap();
+    let mut init = Box::pin(replica.init_empty_local_shard(dir.path()));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut init)
+            .await
+            .is_err()
+    );
+    drop(init);
+    let mut restore = Box::pin(replica.restore_local_replica_from(
+        &snapshot,
+        RecoveryType::Full,
+        dir.path(),
+        cancel::CancellationToken::new(),
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut restore)
+            .await
+            .is_err()
+    );
+    let _ = release_tx.send(());
+    clearing.await.unwrap().unwrap();
+    assert!(restore.await.unwrap());
+    assert!(!flag.exists());
+    replica.stop_gracefully().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_clear_rejects_source_and_preserves_local_on_flag_error() {
+    let dir = Builder::new()
+        .prefix("snapshot-clear-flag-error")
+        .tempdir()
+        .unwrap();
+    let replica = new_shard_replica_set(&dir, TEST_TARGET_SHARD_ID).await;
+    upsert_point(&replica, 7).await;
+    let flag = shard_initializing_flag_path(dir.path(), TEST_TARGET_SHARD_ID);
+    assert!(
+        replica
+            .clear_local_for_snapshot_recovery(dir.path())
+            .await
+            .is_err()
+    );
+    assert!(!flag.exists());
+    assert_eq!(count_points(&replica).await, 1);
+    replica
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+    std::fs::create_dir(&flag).unwrap();
+    assert!(
+        replica
+            .clear_local_for_snapshot_recovery(dir.path())
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        replica.local.read().await.as_ref(),
+        Some(Shard::Local(_))
+    ));
+    replica.stop_gracefully().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cancel_collection_clear_keeps_holder_and_data_locks_until_cleanup() {
+    use crate::collection::Collection;
+    use crate::shards::collection_shard_distribution::CollectionShardDistribution;
+    use crate::shards::transfer::{ShardTransfer, ShardTransferMethod};
+
+    let config_dir = Builder::new().prefix("clear-config").tempdir().unwrap();
+    let fixture = new_shard_replica_set(&config_dir, TEST_SOURCE_SHARD_ID).await;
+    let config = fixture.collection_config.read().await.clone();
+    fixture.stop_gracefully().await;
+    let dir = Builder::new()
+        .prefix("clear-cancel-collection")
+        .tempdir()
+        .unwrap();
+    let snapshots = Builder::new()
+        .prefix("clear-cancel-snapshots")
+        .tempdir()
+        .unwrap();
+    let collection = Arc::new(
+        Collection::new(
+            TEST_COLLECTION_ID.to_string(),
+            TEST_PEER_ID,
+            dir.path(),
+            snapshots.path(),
+            &config,
+            Arc::new(SharedStorageConfig::default()),
+            CollectionShardDistribution::all_local(Some(1), TEST_PEER_ID),
+            None,
+            ChannelService::default(),
+            dummy_on_replica_failure(),
+            Arc::new(|_| {}),
+            dummy_abort_shard_transfer(),
+            Some(AdaptiveSearchHandle::current_for_tests()),
+            Some(Handle::current()),
+            ResourceBudget::default(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    // Reject an unregistered sender before touching data.
+    assert!(
+        collection
+            .clear_local_shard_for_snapshot_recovery(0, Some(2))
+            .await
+            .is_err()
+    );
+    let holder = collection.shards_holder();
+    let replica = {
+        let shards = holder.read().await;
+        shards
+            .register_start_shard_transfer(ShardTransfer {
+                shard_id: 0,
+                to_shard_id: None,
+                from: 2,
+                to: TEST_PEER_ID,
+                sync: true,
+                method: Some(ShardTransferMethod::Snapshot),
+                filter: None,
+            })
+            .unwrap();
+        Arc::clone(shards.get_shard(0).unwrap())
+    };
+    replica
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+    let flag = shard_initializing_flag_path(dir.path(), 0);
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    CLEAR_LOCAL_REPLICA_HOOK
+        .lock()
+        .unwrap()
+        .push((flag.clone(), reached_tx, release_rx));
+    let caller = {
+        let collection = Arc::clone(&collection);
+        tokio::spawn(async move {
+            collection
+                .clear_local_shard_for_snapshot_recovery(0, Some(2))
+                .await
+        })
+    };
+    reached_rx.await.unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), holder.write())
+            .await
+            .is_err()
+    );
+    let mut init = Box::pin(replica.init_empty_local_shard(dir.path()));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut init)
+            .await
+            .is_err()
+    );
+    let _ = release_tx.send(());
+    init.await.unwrap();
+    drop(holder.write().await);
+    assert!(!flag.exists());
+    assert!(LocalShard::check_data(&replica.shard_path));
+    replica.stop_gracefully().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_clear_restore_roundtrip_preserves_records() {
+    use segment::types::{WithPayloadInterface, WithVector};
+    let source_dir = Builder::new()
+        .prefix("clear-roundtrip-source")
+        .tempdir()
+        .unwrap();
+    let source = new_shard_replica_set(&source_dir, TEST_SOURCE_SHARD_ID).await;
+    let points = (1..=3)
+        .map(|id| PointStructPersisted {
+            id: id.into(),
+            vector: VectorStructPersisted::Single(vec![id as f32, 0.2, 0.3, 0.4]),
+            payload: Some(
+                serde_json::from_value(
+                    serde_json::json!({"label": format!("point-{id}"), "number": id}),
+                )
+                .unwrap(),
+            ),
+        })
+        .collect();
+    source
+        .update_local(
+            OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
+                PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(points)),
+            )),
+            WaitUntil::Visible,
+            None,
+            false,
+        )
+        .measured(AmbientContext::new())
+        .await
+        .unwrap()
+        .unwrap();
+    let before = source
+        .local_scroll_by_id(
+            None,
+            10,
+            &WithPayloadInterface::Bool(true),
+            &WithVector::Bool(true),
+            None,
+            None,
+            None,
+            DeferredBehavior::VisibleOnly,
+        )
+        .measured(AmbientContext::new())
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 3);
+    source.force_flush_local_for_test().await;
+    source.stop_gracefully().await;
+    let dir = Builder::new()
+        .prefix("clear-roundtrip-target")
+        .tempdir()
+        .unwrap();
+    let target = new_shard_replica_set(&dir, TEST_TARGET_SHARD_ID).await;
+    upsert_point(&target, 99).await;
+    target
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+    target
+        .clear_local_for_snapshot_recovery(dir.path())
+        .await
+        .unwrap();
+    assert!(
+        target
+            .restore_local_replica_from(
+                &source.shard_path,
+                RecoveryType::Full,
+                dir.path(),
+                cancel::CancellationToken::new()
+            )
+            .await
+            .unwrap()
+    );
+    target
+        .set_replica_state(TEST_PEER_ID, ReplicaState::Active)
+        .await
+        .unwrap();
+    let after = target
+        .local_scroll_by_id(
+            None,
+            10,
+            &WithPayloadInterface::Bool(true),
+            &WithVector::Bool(true),
+            None,
+            None,
+            None,
+            DeferredBehavior::VisibleOnly,
+        )
+        .measured(AmbientContext::new())
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    target.stop_gracefully().await;
 }
 
 /// An abandoned snapshot recovery must not roll back the one that replaced it.

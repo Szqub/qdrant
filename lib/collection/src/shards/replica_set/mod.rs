@@ -132,6 +132,9 @@ pub struct ShardReplicaSet {
     ///
     /// See [`ShardReplicaSet::take_snapshot_recovery_lock`].
     snapshot_recovery_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes local data replacement and cleanup. Acquire before `local`.
+    /// Readers only need `local`, so they can observe a dummy during cleanup.
+    local_data_lock: Mutex<()>,
 }
 
 pub type AbortShardTransfer = Arc<dyn Fn(ShardTransfer, &str) + Send + Sync>;
@@ -232,6 +235,7 @@ impl ShardReplicaSet {
             clock_set: Default::default(),
             partial_snapshot_meta: PartialSnapshotMeta::default(),
             snapshot_recovery_lock: Default::default(),
+            local_data_lock: Mutex::new(()),
         })
     }
 
@@ -365,6 +369,7 @@ impl ShardReplicaSet {
             clock_set: Default::default(),
             partial_snapshot_meta: PartialSnapshotMeta::default(),
             snapshot_recovery_lock: Default::default(),
+            local_data_lock: Mutex::new(()),
         };
 
         // `active_remote_shards` includes `Active` and `ReshardingScaleDown` replicas!
@@ -379,6 +384,7 @@ impl ShardReplicaSet {
     }
 
     pub async fn stop_gracefully(&self) {
+        let _data_lock = self.local_data_lock.lock().await;
         if let Some(local) = self.local.write().await.take() {
             local.stop_gracefully().await;
         }
@@ -665,6 +671,7 @@ impl ShardReplicaSet {
     /// than the real thing. That dummy state is picked up like any other initialization failure: a
     /// retried call to this method clears it and tries again.
     pub async fn init_empty_local_shard(&self, collection_path: &Path) -> CollectionResult<()> {
+        let _data_lock = self.local_data_lock.lock().await;
         let mut local = self.local.write().await;
 
         // Keep a dummy placeholder because every await below may drop the future early on
@@ -734,6 +741,7 @@ impl ShardReplicaSet {
         local: LocalShard,
         state: Option<ReplicaState>,
     ) -> CollectionResult<Option<Shard>> {
+        let _data_lock = self.local_data_lock.lock().await;
         let old_shard = self.local.write().await.replace(Shard::Local(local));
 
         if !self.replica_state.read().is_local || state.is_some() {
@@ -753,6 +761,8 @@ impl ShardReplicaSet {
 
     pub async fn remove_local(&self) -> CollectionResult<()> {
         // TODO: Ensure cancel safety!
+
+        let _data_lock = self.local_data_lock.lock().await;
 
         self.replica_state.write(|rs| {
             rs.is_local = false;
