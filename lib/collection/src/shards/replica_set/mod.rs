@@ -134,6 +134,8 @@ pub struct ShardReplicaSet {
     snapshot_recovery_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes local data replacement and cleanup. Acquire before `local`.
     /// Readers only need `local`, so they can observe a dummy during cleanup.
+    /// This does not cover callers building a `LocalShard` before `set_local`;
+    /// those builds were already outside the local shard write lock.
     local_data_lock: Mutex<()>,
 }
 
