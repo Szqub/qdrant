@@ -237,7 +237,7 @@ async fn test_snapshot_clear_rejects_source_and_preserves_local_on_flag_error() 
         .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
         .await
         .unwrap();
-    std::fs::create_dir(&flag).unwrap();
+    fs_err::create_dir(&flag).unwrap();
     assert!(
         replica
             .clear_local_for_snapshot_recovery(dir.path())
@@ -350,6 +350,61 @@ async fn test_cancel_collection_clear_keeps_holder_and_data_locks_until_cleanup(
     let _ = release_tx.send(());
     init.await.unwrap();
     drop(holder.write().await);
+    assert!(!flag.exists());
+    assert!(LocalShard::check_data(&replica.shard_path));
+    replica.stop_gracefully().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_clear_sync_error_keeps_old_shard_and_delete_error_keeps_dummy() {
+    let dir = Builder::new()
+        .prefix("clear-failure-states")
+        .tempdir()
+        .unwrap();
+    let replica = new_shard_replica_set(&dir, TEST_TARGET_SHARD_ID).await;
+    upsert_point(&replica, 7).await;
+    replica
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+    let flag = shard_initializing_flag_path(dir.path(), TEST_TARGET_SHARD_ID);
+    CLEAR_FLAG_SYNC_ERRORS.lock().unwrap().push(flag.clone());
+    let error = replica
+        .clear_local_for_snapshot_recovery(dir.path())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected initializing flag sync failure")
+    );
+    assert!(matches!(
+        replica.local.read().await.as_ref(),
+        Some(Shard::Local(_))
+    ));
+    assert!(flag.exists());
+
+    replica.stop_gracefully().await;
+    // A directory in place of a data file produces a real filesystem remove_file
+    // error on both Unix and Windows, without permissions or platform-specific handles.
+    let files = shard::files::get_shard_data_files(&replica.shard_path);
+    if files.newest_clocks_path.exists() {
+        fs_err::remove_file(&files.newest_clocks_path).unwrap();
+    }
+    fs_err::create_dir(&files.newest_clocks_path).unwrap();
+    assert!(
+        replica
+            .clear_local_for_snapshot_recovery(dir.path())
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        replica.local.read().await.as_ref(),
+        Some(Shard::Dummy(_))
+    ));
+    assert!(flag.exists());
+    fs_err::remove_dir(&files.newest_clocks_path).unwrap();
+    replica.init_empty_local_shard(dir.path()).await.unwrap();
     assert!(!flag.exists());
     assert!(LocalShard::check_data(&replica.shard_path));
     replica.stop_gracefully().await;

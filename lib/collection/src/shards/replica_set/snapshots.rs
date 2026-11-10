@@ -35,6 +35,10 @@ static RESTORE_LOCAL_REPLICA_BEFORE_FLAG_HOOK: std::sync::Mutex<
 static CLEAR_LOCAL_REPLICA_HOOK: std::sync::Mutex<Vec<RestoreLocalReplicaBeforeFlagHook>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(test)]
+static CLEAR_FLAG_SYNC_ERRORS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
 impl ShardReplicaSet {
     pub async fn create_snapshot(
         &self,
@@ -465,6 +469,16 @@ impl ShardReplicaSet {
         // dummy that triggers recovery.
         let shard_flag = shard_initializing_flag_path(collection_path, self.shard_id);
         let flag_file = tokio_fs::File::create(&shard_flag).await?;
+        #[cfg(test)]
+        {
+            let mut errors = CLEAR_FLAG_SYNC_ERRORS.lock().unwrap();
+            if let Some(index) = errors.iter().position(|path| path == &shard_flag) {
+                errors.remove(index);
+                return Err(
+                    std::io::Error::other("injected initializing flag sync failure").into(),
+                );
+            }
+        }
         flag_file.sync_all().await?;
         sync_parent_dir_async(&shard_flag).await?;
 
