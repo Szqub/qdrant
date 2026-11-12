@@ -8,7 +8,10 @@ use common::budget::ResourceBudget;
 use common::save_on_disk::SaveOnDisk;
 use common::types::DeferredBehavior;
 use rstest::rstest;
-use segment::types::Distance;
+use segment::json_path::JsonPath;
+use segment::types::{
+    Distance, PayloadFieldSchema, PayloadSchemaType, PointIdType, WithPayload, WithVector,
+};
 use tempfile::{Builder, TempDir};
 use tokio::runtime::Handle;
 use tokio::sync::{RwLock, mpsc, oneshot};
@@ -22,9 +25,11 @@ use crate::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
 };
 use crate::operations::shared_storage_config::SharedStorageConfig;
-use crate::operations::types::{CountRequestInternal, VectorsConfig};
+use crate::operations::types::{CountRequestInternal, PointRequestInternal, VectorsConfig};
 use crate::operations::vector_params_builder::VectorParamsBuilder;
-use crate::operations::{CollectionUpdateOperations, OperationWithClockTag};
+use crate::operations::{
+    CollectionUpdateOperations, CreateIndex, FieldIndexOperations, OperationWithClockTag,
+};
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
@@ -486,4 +491,329 @@ fn dummy_on_replica_failure() -> ChangePeerFromState {
 
 fn dummy_abort_shard_transfer() -> AbortShardTransfer {
     Arc::new(|_shard_transfer, _reason| {})
+}
+
+/// While `clear_local_for_snapshot_recovery` stops the old shard and deletes its data, it holds
+/// the `local` write lock. Updates the replica rejects in its current state must not wait for
+/// that, while updates it accepts must still be serialized behind the clear.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_clear_does_not_delay_rejected_updates() {
+    let collection_dir = Builder::new()
+        .prefix("snapshot-clear-rejected-updates")
+        .tempdir()
+        .unwrap();
+    let replica_set = Arc::new(new_shard_replica_set(&collection_dir, TEST_TARGET_SHARD_ID).await);
+    upsert_point(&replica_set, 1).await;
+
+    replica_set
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+
+    let shard_flag = shard_initializing_flag_path(collection_dir.path(), TEST_TARGET_SHARD_ID);
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    install_clear_local_replica_before_clear_hook(shard_flag.clone(), reached_tx, release_rx).await;
+
+    let clear = tokio::spawn({
+        let replica_set = Arc::clone(&replica_set);
+        let collection_path = collection_dir.path().to_path_buf();
+        async move {
+            replica_set
+                .clear_local_for_snapshot_recovery(&collection_path)
+                .await
+        }
+    });
+
+    // The clear now holds the `local` write lock, with the dummy installed.
+    reached_rx.await.unwrap();
+    assert!(shard_flag.exists());
+
+    let point_update = || {
+        OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
+            PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
+                PointStructPersisted {
+                    id: PointIdType::from(2u64),
+                    vector: VectorStructPersisted::Single(vec![0.1, 0.2, 0.3, 0.4]),
+                    payload: None,
+                },
+            ])),
+        ))
+    };
+
+    // Payload index changes reach every local shard through `Collection::update_all_local`,
+    // which consensus drives without the force flag.
+    let index_update =
+        OperationWithClockTag::from(CollectionUpdateOperations::FieldIndexOperation(
+            FieldIndexOperations::CreateIndex(CreateIndex {
+                field_name: JsonPath::new("keyword"),
+                field_schema: Some(PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword)),
+            }),
+        ));
+
+    for operation in [point_update(), index_update] {
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            replica_set
+                .update_local(operation, WaitUntil::Visible, None, false)
+                .measured(AmbientContext::new()),
+        )
+        .await
+        .expect("rejected update must not wait for the snapshot clear")
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "PartialSnapshot must reject unforced updates"
+        );
+    }
+
+    // A forced update is accepted in `PartialSnapshot`, so it still waits for the clear to finish.
+    let mut forced = tokio::spawn({
+        let replica_set = Arc::clone(&replica_set);
+        async move {
+            replica_set
+                .update_local(point_update(), WaitUntil::Visible, None, true)
+                .measured(AmbientContext::new())
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut forced)
+            .await
+            .is_err(),
+        "forced update must stay serialized behind the snapshot clear",
+    );
+
+    release_tx.send(()).unwrap();
+    clear.await.unwrap().unwrap();
+
+    // After the clear, the forced update reaches the dummy, which rejects point updates.
+    assert!(forced.await.unwrap().is_err());
+    assert!(replica_set.is_dummy().await);
+    assert!(shard_flag.exists());
+
+    replica_set.stop_gracefully().await;
+}
+
+/// An update that the replica accepted before waiting for the `local` lock must be decided again
+/// once it holds the lock, because the replica state may have changed meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_update_waiting_for_snapshot_clear_rechecks_replica_state() {
+    let collection_dir = Builder::new()
+        .prefix("snapshot-clear-state-change")
+        .tempdir()
+        .unwrap();
+    let replica_set = Arc::new(new_shard_replica_set(&collection_dir, TEST_TARGET_SHARD_ID).await);
+
+    // `Partial` accepts unforced updates, but cannot be a source of truth, so it may be cleared.
+    replica_set
+        .set_replica_state(TEST_PEER_ID, ReplicaState::Partial)
+        .await
+        .unwrap();
+
+    let shard_flag = shard_initializing_flag_path(collection_dir.path(), TEST_TARGET_SHARD_ID);
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    install_clear_local_replica_before_clear_hook(shard_flag, reached_tx, release_rx).await;
+
+    let clear = tokio::spawn({
+        let replica_set = Arc::clone(&replica_set);
+        let collection_path = collection_dir.path().to_path_buf();
+        async move {
+            replica_set
+                .clear_local_for_snapshot_recovery(&collection_path)
+                .await
+        }
+    });
+    reached_rx.await.unwrap();
+
+    // Accepted in `Partial`, so it waits for the `local` lock held by the clear. If the task only
+    // started after the state change below, the early check would reject it and this test would
+    // pass without exercising the check under the lock, but it can't fail falsely.
+    let mut update = tokio::spawn({
+        let replica_set = Arc::clone(&replica_set);
+        async move {
+            let operation = OperationWithClockTag::from(
+                CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
+                    PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
+                        id: PointIdType::from(2u64),
+                        vector: VectorStructPersisted::Single(vec![0.1, 0.2, 0.3, 0.4]),
+                        payload: None,
+                    }]),
+                )),
+            );
+            replica_set
+                .update_local(operation, WaitUntil::Visible, None, false)
+                .measured(AmbientContext::new())
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut update)
+            .await
+            .is_err(),
+        "update accepted in Partial must wait for the snapshot clear",
+    );
+
+    // The replica moves to `PartialSnapshot` while the update waits. `set_replica_state` stores
+    // the new state before it waits for the `local` lock itself.
+    let set_state = tokio::spawn({
+        let replica_set = Arc::clone(&replica_set);
+        async move {
+            replica_set
+                .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while replica_set.peer_state(TEST_PEER_ID) != Some(ReplicaState::PartialSnapshot) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replica state must change to PartialSnapshot");
+
+    release_tx.send(()).unwrap();
+    clear.await.unwrap().unwrap();
+    set_state.await.unwrap().unwrap();
+
+    // Decided with the current state, the update is rejected, instead of failing on the dummy.
+    assert!(update.await.unwrap().unwrap().is_none());
+
+    replica_set.stop_gracefully().await;
+}
+
+/// Restore a snapshot into a replica that was cleared for snapshot recovery. The dummy and the
+/// initializing flag must be gone, and the replica must hold exactly the points of the snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_snapshot_clear_and_restore_roundtrip() {
+    let source_dir = Builder::new()
+        .prefix("snapshot-clear-roundtrip-source")
+        .tempdir()
+        .unwrap();
+    let target_dir = Builder::new()
+        .prefix("snapshot-clear-roundtrip-target")
+        .tempdir()
+        .unwrap();
+
+    let source = new_shard_replica_set(&source_dir, TEST_SOURCE_SHARD_ID).await;
+    let source_ids = [10, 11, 12];
+    for id in source_ids {
+        upsert_point_with_payload(&source, id).await;
+    }
+    let expected = retrieve_local(&source, &source_ids).await;
+    assert_eq!(expected.len(), source_ids.len());
+    source.force_flush_local_for_test().await;
+    source.stop_gracefully().await;
+    let snapshot = source_dir.path().join(TEST_SOURCE_SHARD_ID.to_string());
+
+    let target = new_shard_replica_set(&target_dir, TEST_TARGET_SHARD_ID).await;
+    upsert_point(&target, 99).await;
+    target
+        .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
+        .await
+        .unwrap();
+
+    target
+        .clear_local_for_snapshot_recovery(target_dir.path())
+        .await
+        .unwrap();
+    assert!(target.is_dummy().await);
+    let shard_flag = shard_initializing_flag_path(target_dir.path(), TEST_TARGET_SHARD_ID);
+    assert!(shard_flag.exists());
+
+    let restored = target
+        .restore_local_replica_from(
+            &snapshot,
+            RecoveryType::Full,
+            target_dir.path(),
+            cancel::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(restored);
+    assert!(!target.is_dummy().await);
+    assert!(!shard_flag.exists());
+
+    // The point that only existed on the target before the clear must be gone.
+    assert_eq!(count_points(&target).await, source_ids.len());
+    let mut ids = source_ids.to_vec();
+    ids.push(99);
+    assert_eq!(retrieve_local(&target, &ids).await, expected);
+
+    target.stop_gracefully().await;
+}
+
+async fn upsert_point_with_payload(replica_set: &ShardReplicaSet, id: u64) {
+    let payload = segment::payload_json! { "keyword": format!("point-{id}") };
+    let operation = OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
+        PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
+            PointStructPersisted {
+                id: PointIdType::from(id),
+                vector: VectorStructPersisted::Single(vec![id as f32, 0.5, 0.25, 0.125]),
+                payload: Some(payload),
+            },
+        ])),
+    ));
+
+    replica_set
+        .update_local(operation, WaitUntil::Visible, None, false)
+        .measured(AmbientContext::new())
+        .await
+        .expect("failed to upsert point")
+        .expect("local shard must be present");
+}
+
+async fn retrieve_local(
+    replica_set: &ShardReplicaSet,
+    ids: &[u64],
+) -> Vec<shard::retrieve::record_internal::RecordInternal> {
+    let local = replica_set.local.read().await;
+    let shard = local.as_ref().expect("local shard must be present");
+    let mut records = shard
+        .get()
+        .retrieve(
+            Arc::new(PointRequestInternal {
+                ids: ids.iter().map(|&id| PointIdType::from(id)).collect(),
+                with_payload: None,
+                with_vector: WithVector::Bool(true),
+            }),
+            &WithPayload {
+                enable: true,
+                payload_selector: None,
+            },
+            &WithVector::Bool(true),
+            &replica_set.search_runtime,
+            None,
+            DeferredBehavior::VisibleOnly,
+        )
+        .measured(AmbientContext::new())
+        .await
+        .expect("failed to retrieve points");
+    records.sort_by_key(|record| record.id);
+    records
+}
+
+/// Install the clear hook, waiting for another test to consume its hook first.
+async fn install_clear_local_replica_before_clear_hook(
+    shard_flag: std::path::PathBuf,
+    reached: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+) {
+    let mut new_hook = Some((shard_flag, reached, release));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        {
+            let mut hook = CLEAR_LOCAL_REPLICA_BEFORE_CLEAR_HOOK.lock().unwrap();
+            if hook.is_none() {
+                *hook = new_hook.take();
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clear-local-replica test hook is still installed by another test",
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

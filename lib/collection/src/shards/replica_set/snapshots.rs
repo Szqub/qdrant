@@ -21,16 +21,21 @@ use crate::shards::shard_trait::ShardOperation as _;
 use crate::shards::{remove_shard_initializing_flag, shard_initializing_flag_path};
 
 #[cfg(test)]
-type RestoreLocalReplicaBeforeFlagHook = (
+type SnapshotTestHook = (
     std::path::PathBuf,
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 );
 
 #[cfg(test)]
-static RESTORE_LOCAL_REPLICA_BEFORE_FLAG_HOOK: std::sync::Mutex<
-    Option<RestoreLocalReplicaBeforeFlagHook>,
-> = std::sync::Mutex::new(None);
+static RESTORE_LOCAL_REPLICA_BEFORE_FLAG_HOOK: std::sync::Mutex<Option<SnapshotTestHook>> =
+    std::sync::Mutex::new(None);
+
+/// Pauses `clear_local_for_snapshot_recovery` after the dummy is installed, while it holds the
+/// `local` write lock and before the shard data is cleared.
+#[cfg(test)]
+static CLEAR_LOCAL_REPLICA_BEFORE_CLEAR_HOOK: std::sync::Mutex<Option<SnapshotTestHook>> =
+    std::sync::Mutex::new(None);
 
 impl ShardReplicaSet {
     pub async fn create_snapshot(
@@ -272,7 +277,7 @@ impl ShardReplicaSet {
         let shard_flag = shard_initializing_flag_path(collection_path, self.shard_id);
 
         #[cfg(test)]
-        wait_restore_local_replica_before_flag_hook_for_test(&shard_flag).await;
+        wait_test_hook(&RESTORE_LOCAL_REPLICA_BEFORE_FLAG_HOOK, &shard_flag).await;
 
         if cancel.is_cancelled() {
             return Err(CollectionError::from(cancel::Error::Cancelled));
@@ -490,6 +495,13 @@ impl ShardReplicaSet {
         )
         .await?;
 
+        #[cfg(test)]
+        wait_test_hook(
+            &CLEAR_LOCAL_REPLICA_BEFORE_CLEAR_HOOK,
+            &shard_initializing_flag_path(collection_path, self.shard_id),
+        )
+        .await;
+
         LocalShard::clear(&self.shard_path).await?;
         Ok(())
     }
@@ -513,9 +525,9 @@ impl ShardReplicaSet {
 }
 
 #[cfg(test)]
-async fn wait_restore_local_replica_before_flag_hook_for_test(shard_flag: &Path) {
+async fn wait_test_hook(hook: &std::sync::Mutex<Option<SnapshotTestHook>>, shard_flag: &Path) {
     let hook = {
-        let mut hook = RESTORE_LOCAL_REPLICA_BEFORE_FLAG_HOOK.lock().unwrap();
+        let mut hook = hook.lock().unwrap();
         if hook
             .as_ref()
             .is_some_and(|(expected_shard_flag, _, _)| expected_shard_flag.as_path() == shard_flag)
