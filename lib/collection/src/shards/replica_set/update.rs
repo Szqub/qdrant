@@ -51,13 +51,23 @@ impl ShardReplicaSet {
         // `ShardOperations::update` is not guaranteed to be cancel safe, so this method is not
         // cancel safe.
 
+        // Reject operations this replica does not accept *before* taking the `local` lock, so they
+        // don't wait for a long `local.write()`, such as `clear_local_for_snapshot_recovery`
+        // stopping the old shard and deleting its data.
+        //
+        // The replica state is not protected by the `local` lock and may change while we wait for
+        // it, so the decision is made again once the lock is held.
+        if self.local_update_state(&operation, force).is_none() {
+            return Ok(None);
+        }
+
         let local = self.local.read().await;
 
         let Some(shard) = local.deref() else {
             return Ok(None);
         };
 
-        let Some(state) = self.peer_state(self.this_peer_id()) else {
+        let Some(state) = self.local_update_state(&operation, force) else {
             return Ok(None);
         };
 
@@ -66,43 +76,6 @@ impl ShardReplicaSet {
         } else {
             ambient::current()
         };
-
-        // Decide whether to apply the operation in the current replica state.
-        // `force` and a force-tagged clock both bypass the recovery-state guard.
-        let accepts_operation = match state {
-            ReplicaState::Active
-            | ReplicaState::Partial
-            | ReplicaState::Initializing
-            | ReplicaState::Listener
-            | ReplicaState::Resharding
-            | ReplicaState::ReshardingScaleDown
-            | ReplicaState::ActiveRead => true,
-            // Recovery states only accept updates with an explicit force flag.
-            ReplicaState::PartialSnapshot | ReplicaState::Recovery => {
-                force || operation.clock_tag.is_some_and(|tag| tag.force)
-            }
-            // Dead/ManualRecovery only accept updates when the caller forces.
-            ReplicaState::Dead | ReplicaState::ManualRecovery => force,
-        };
-
-        if !accepts_operation {
-            if matches!(
-                state,
-                ReplicaState::PartialSnapshot | ReplicaState::Recovery
-            ) && log::log_enabled!(log::Level::Debug)
-            {
-                if let Some(ids) = operation.operation.point_ids() {
-                    log::debug!(
-                        "Operation affecting point IDs {ids:?} rejected on this peer, force flag required in recovery state",
-                    );
-                } else {
-                    log::debug!(
-                        "Operation {operation:?} rejected on this peer, force flag required in recovery state",
-                    );
-                }
-            }
-            return Ok(None);
-        }
 
         // Listener replicas only durably ack to WAL; everything else honours
         // the caller-supplied wait/timeout.
@@ -142,6 +115,56 @@ impl ShardReplicaSet {
         };
 
         Ok(Some(result))
+    }
+
+    /// Returns the state of this replica if it accepts the given local update, or `None` if it
+    /// rejects it.
+    ///
+    /// `force` and a force-tagged clock both bypass the recovery-state guard.
+    fn local_update_state(
+        &self,
+        operation: &OperationWithClockTag,
+        force: bool,
+    ) -> Option<ReplicaState> {
+        let state = self.peer_state(self.this_peer_id())?;
+
+        let accepts_operation = match state {
+            ReplicaState::Active
+            | ReplicaState::Partial
+            | ReplicaState::Initializing
+            | ReplicaState::Listener
+            | ReplicaState::Resharding
+            | ReplicaState::ReshardingScaleDown
+            | ReplicaState::ActiveRead => true,
+            // Recovery states only accept updates with an explicit force flag.
+            ReplicaState::PartialSnapshot | ReplicaState::Recovery => {
+                force || operation.clock_tag.is_some_and(|tag| tag.force)
+            }
+            // Dead/ManualRecovery only accept updates when the caller forces.
+            ReplicaState::Dead | ReplicaState::ManualRecovery => force,
+        };
+
+        if accepts_operation {
+            return Some(state);
+        }
+
+        if matches!(
+            state,
+            ReplicaState::PartialSnapshot | ReplicaState::Recovery
+        ) && log::log_enabled!(log::Level::Debug)
+        {
+            if let Some(ids) = operation.operation.point_ids() {
+                log::debug!(
+                    "Operation affecting point IDs {ids:?} rejected on this peer, force flag required in recovery state",
+                );
+            } else {
+                log::debug!(
+                    "Operation {operation:?} rejected on this peer, force flag required in recovery state",
+                );
+            }
+        }
+
+        None
     }
 
     /// # Cancel safety
