@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroU32;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +8,7 @@ use common::ambient::{self, AmbientContext, AmbientFutureExt};
 use common::budget::ResourceBudget;
 use common::save_on_disk::SaveOnDisk;
 use common::types::DeferredBehavior;
+use futures::FutureExt as _;
 use rstest::rstest;
 use segment::json_path::JsonPath;
 use segment::types::{
@@ -505,6 +507,7 @@ fn dummy_abort_shard_transfer() -> AbortShardTransfer {
 /// that, while updates it accepts must still be serialized behind the clear.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_clear_does_not_delay_rejected_updates() {
+    let _scope = ambient::async_test_guard();
     let collection_dir = Builder::new()
         .prefix("snapshot-clear-rejected-updates")
         .tempdir()
@@ -530,6 +533,7 @@ async fn test_snapshot_clear_does_not_delay_rejected_updates() {
                 .clear_local_for_snapshot_recovery(&collection_path)
                 .await
         }
+        .in_current_ambient()
     });
 
     // The clear now holds the `local` write lock, with the dummy installed.
@@ -558,44 +562,37 @@ async fn test_snapshot_clear_does_not_delay_rejected_updates() {
             }),
         ));
 
+    // A rejected update completes on its first poll, while the clear still holds the lock.
     for operation in [point_update(), index_update] {
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            replica_set
-                .update_local(operation, WaitUntil::Visible, None, false)
-                .measured(AmbientContext::new()),
-        )
-        .await
-        .expect("rejected update must not wait for the snapshot clear")
-        .unwrap();
+        let result = replica_set
+            .update_local(operation, WaitUntil::Visible, None, false)
+            .measured(AmbientContext::new())
+            .now_or_never()
+            .expect("rejected update must not wait for the snapshot clear")
+            .unwrap();
         assert!(
             result.is_none(),
             "PartialSnapshot must reject unforced updates"
         );
     }
 
-    // A forced update is accepted in `PartialSnapshot`, so it still waits for the clear to finish.
-    let mut forced = tokio::spawn({
-        let replica_set = Arc::clone(&replica_set);
-        async move {
-            replica_set
-                .update_local(point_update(), WaitUntil::Visible, None, true)
-                .measured(AmbientContext::new())
-                .await
-        }
-    });
+    // A forced update is accepted in `PartialSnapshot`, so it waits for the lock held by the clear.
+    let mut forced = pin!(
+        replica_set
+            .update_local(point_update(), WaitUntil::Visible, None, true)
+            .measured(AmbientContext::new())
+    );
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut forced)
-            .await
-            .is_err(),
+        futures::poll!(forced.as_mut()).is_pending(),
         "forced update must stay serialized behind the snapshot clear",
     );
 
     release_tx.send(()).unwrap();
     clear.await.unwrap().unwrap();
 
-    // After the clear, the forced update reaches the dummy, which rejects point updates.
-    assert!(forced.await.unwrap().is_err());
+    // In this test, the forced update reaches the dummy after the clear, and the dummy rejects
+    // point updates.
+    assert!(forced.await.is_err());
     assert!(replica_set.is_dummy().await);
     assert!(shard_flag.exists());
 
@@ -606,6 +603,7 @@ async fn test_snapshot_clear_does_not_delay_rejected_updates() {
 /// once it holds the lock, because the replica state may have changed meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_update_waiting_for_snapshot_clear_rechecks_replica_state() {
+    let _scope = ambient::async_test_guard();
     let collection_dir = Builder::new()
         .prefix("snapshot-clear-state-change")
         .tempdir()
@@ -631,34 +629,29 @@ async fn test_update_waiting_for_snapshot_clear_rechecks_replica_state() {
                 .clear_local_for_snapshot_recovery(&collection_path)
                 .await
         }
+        .in_current_ambient()
     });
     reached_rx.await.unwrap();
 
-    // Accepted in `Partial`, so it waits for the `local` lock held by the clear. If the task only
-    // started after the state change below, the early check would reject it and this test would
-    // pass without exercising the check under the lock, but it can't fail falsely.
-    let mut update = tokio::spawn({
-        let replica_set = Arc::clone(&replica_set);
-        async move {
-            let operation = OperationWithClockTag::from(
-                CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-                    PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
-                        id: PointIdType::from(2u64),
-                        vector: VectorStructPersisted::Single(vec![0.1, 0.2, 0.3, 0.4]),
-                        payload: None,
-                    }]),
-                )),
-            );
-            replica_set
-                .update_local(operation, WaitUntil::Visible, None, false)
-                .measured(AmbientContext::new())
-                .await
-        }
-    });
+    let operation = OperationWithClockTag::from(CollectionUpdateOperations::PointOperation(
+        PointOperations::UpsertPoints(PointInsertOperationsInternal::PointsList(vec![
+            PointStructPersisted {
+                id: PointIdType::from(2u64),
+                vector: VectorStructPersisted::Single(vec![0.1, 0.2, 0.3, 0.4]),
+                payload: None,
+            },
+        ])),
+    ));
+    let mut update = pin!(
+        replica_set
+            .update_local(operation, WaitUntil::Visible, None, false)
+            .measured(AmbientContext::new())
+    );
+
+    // `update_local` checks the replica state before its first await. So once the first poll is
+    // pending, the update has been accepted in `Partial` and waits for the lock held by the clear.
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut update)
-            .await
-            .is_err(),
+        futures::poll!(update.as_mut()).is_pending(),
         "update accepted in Partial must wait for the snapshot clear",
     );
 
@@ -671,6 +664,7 @@ async fn test_update_waiting_for_snapshot_clear_rechecks_replica_state() {
                 .set_replica_state(TEST_PEER_ID, ReplicaState::PartialSnapshot)
                 .await
         }
+        .in_current_ambient()
     });
     tokio::time::timeout(Duration::from_secs(5), async {
         while replica_set.peer_state(TEST_PEER_ID) != Some(ReplicaState::PartialSnapshot) {
@@ -684,8 +678,9 @@ async fn test_update_waiting_for_snapshot_clear_rechecks_replica_state() {
     clear.await.unwrap().unwrap();
     set_state.await.unwrap().unwrap();
 
-    // Decided with the current state, the update is rejected, instead of failing on the dummy.
-    assert!(update.await.unwrap().unwrap().is_none());
+    // Decided again with the current state, the update is rejected, instead of failing on the
+    // dummy installed by the clear.
+    assert!(update.await.unwrap().is_none());
 
     replica_set.stop_gracefully().await;
 }
@@ -694,6 +689,7 @@ async fn test_update_waiting_for_snapshot_clear_rechecks_replica_state() {
 /// initializing flag must be gone, and the replica must hold exactly the points of the snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_snapshot_clear_and_restore_roundtrip() {
+    let _scope = ambient::async_test_guard();
     let source_dir = Builder::new()
         .prefix("snapshot-clear-roundtrip-source")
         .tempdir()
